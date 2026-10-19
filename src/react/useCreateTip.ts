@@ -11,50 +11,92 @@
  * Always `await` the actions inside try/catch (or `.catch()`) in event handlers.
  */
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useDebugValue } from 'react';
 import { useDorisio } from './DorisioProvider';
 import { Transaction } from '../types/models';
 import { runSafely } from './safe-async';
+import {
+  tipFormReducer,
+  initialTipFormState,
+  type TipFormState,
+  type TipFormAction,
+} from './useCreateTip.reducer';
 import type {
   CreateTipRequest,
   BuildTransactionRequest,
   BuildTransactionResponse,
   SubmitTransactionResponse,
 } from '../client/transactions';
+import { formatDebugValue } from './debug-format';
 
-export interface UseCreateTipState {
-  data?: Transaction;
-  loading: boolean;
-  error?: string;
-  step: 'idle' | 'creating' | 'building' | 'submitting' | 'confirming' | 'success' | 'error';
-}
+export interface UseCreateTipState extends TipFormState {}
 
 export interface UseCreateTipActions {
-  createTip: (data: CreateTipRequest) => Promise<Transaction>;
+  createTip: (data: CreateTipRequest, options?: { debounceMs?: number }) => Promise<Transaction>;
   buildTransaction: (
     tipId: string,
-    data: BuildTransactionRequest
+    data: BuildTransactionRequest,
+    options?: { debounceMs?: number }
   ) => Promise<BuildTransactionResponse>;
-  submitTransaction: (tipId: string, envelope: string) => Promise<SubmitTransactionResponse>;
-  confirmTransaction: (tipId: string) => Promise<Transaction>;
+  submitTransaction: (
+    tipId: string,
+    envelope: string,
+    options?: { debounceMs?: number }
+  ) => Promise<SubmitTransactionResponse>;
+  confirmTransaction: (tipId: string, options?: { debounceMs?: number }) => Promise<Transaction>;
   reset: () => void;
 }
 
 /**
- * useCreateTip
+ * Hook for orchestrating the complete tip payment flow (create, build, submit, confirm).
  *
- * Manages the tip creation workflow including Stellar transaction building and submission.
+ * @returns State and action handlers for the tipping lifecycle
+ *
+ * @debugValue Displays `{ loading, submitting, step, error, dataId }` in React DevTools.
+ *   - `loading` (boolean): whether any request is in flight
+ *   - `submitting` (boolean): whether a transaction is being submitted
+ *   - `step` (string): current tip lifecycle step (idle, creating, building, submitting, confirming, success, error)
+ *   - `error` (string | undefined): last error message, if any
+ *   - `dataId` (string | undefined): id of the created/confirmed transaction, if any
+ *
+ * @example
+ * ```tsx
+ * import { useCreateTip } from 'dorisio-sdk/react';
+ *
+ * function TipButton({ creatorId }: { creatorId: string }) {
+ *   const { step, loading, error, createTip, reset } = useCreateTip();
+ *
+ *   const handleTip = async () => {
+ *     try {
+ *       const tip = await createTip({ creatorId, amount: 25, message: 'Thanks!' });
+ *       console.log('Tip created:', tip.id);
+ *     } catch (err) {
+ *       console.error('Tip failed:', err);
+ *     }
+ *   };
+ *
+ *   return (
+ *     <div>
+ *       <button disabled={loading} onClick={handleTip}>
+ *         {loading ? `Processing (${step})...` : 'Tip $25'}
+ *       </button>
+ *       {error && <p className="error">{error}</p>}
+ *     </div>
+ *   );
+ * }
+ * ```
  */
 export function useCreateTip(): UseCreateTipState & UseCreateTipActions {
   const { client, setError, setIsLoading } = useDorisio();
 
-  const [state, setState] = useState<UseCreateTipState>({
-    loading: false,
-    step: 'idle',
-  });
+  const [state, dispatch] = useReducer(tipFormReducer, initialTipFormState);
 
   const isMountedRef = useRef(true);
   const abortControllersRef = useRef<Set<AbortController>>(new Set());
+  const inFlightRef = useRef(false);
+  const inFlightPromiseRef = useRef<Promise<any> | null>(null);
+  const lastSubmitTimeRef = useRef<{ [key: string]: number }>({});
+  const debounceTimeoutRef = useRef<{ [key: string]: NodeJS.Timeout }>({});
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -65,6 +107,10 @@ export function useCreateTip(): UseCreateTipState & UseCreateTipActions {
         controller.abort();
       }
       controllers.clear();
+      for (const timeout of Object.values(debounceTimeoutRef.current)) {
+        clearTimeout(timeout);
+      }
+      debounceTimeoutRef.current = {};
     };
   }, []);
 
@@ -76,112 +122,188 @@ export function useCreateTip(): UseCreateTipState & UseCreateTipActions {
     });
   };
 
-  const safeSetState = useCallback((fn: React.SetStateAction<UseCreateTipState>) => {
+  const safeDispatch = useCallback((action: TipFormAction) => {
     if (!isMountedRef.current) return;
-    setState(fn);
-  }, []);
+    dispatch(action);
+  }, [dispatch]);
 
-  const start = (step: UseCreateTipState['step']) => () =>
-    safeSetState((s) => ({ ...s, loading: true, step, error: undefined }));
-  const fail = (error: string) =>
-    safeSetState((s) => ({ ...s, error, step: 'error', loading: false }));
+  const withSubmissionGuard = useCallback(
+    <T>(action: string, task: () => Promise<T>, debounceMs: number = 500): Promise<T> => {
+      // Check if we're still in the debounce window
+      const now = Date.now();
+      const lastTime = lastSubmitTimeRef.current[action] || 0;
+      const timeSinceLastSubmit = now - lastTime;
+
+      if (timeSinceLastSubmit < debounceMs) {
+        // Within debounce window
+        if (inFlightRef.current && inFlightPromiseRef.current) {
+          // Return the existing in-flight promise
+          return inFlightPromiseRef.current;
+        }
+        // Reject: another submission within debounce window
+        return Promise.reject(
+          new Error(
+            `Duplicate ${action} submission rejected. Please wait ${Math.ceil(
+              (debounceMs - timeSinceLastSubmit) / 1000
+            )}s before retrying.`
+          )
+        );
+      }
+
+      if (inFlightRef.current && inFlightPromiseRef.current) {
+        // Return the existing in-flight promise
+        return inFlightPromiseRef.current;
+      }
+
+      inFlightRef.current = true;
+      lastSubmitTimeRef.current[action] = now;
+
+      const promise = task().finally(() => {
+        inFlightRef.current = false;
+        inFlightPromiseRef.current = null;
+      });
+
+      inFlightPromiseRef.current = promise;
+      return promise;
+    },
+    []
+  );
+
+  const start = useCallback(
+    (step: TipFormState['step']) => () => safeDispatch({ type: 'START', step }),
+    [safeDispatch]
+  );
+  const fail = useCallback(
+    (error: string) => safeDispatch({ type: 'FAIL', error }),
+    [safeDispatch]
+  );
 
   const createTip = useCallback(
-    (data: CreateTipRequest): Promise<Transaction> =>
-      runSafely(
-        { setError, setIsLoading },
-        {
-          code: 'CREATE_TIP_ERROR',
-          fallbackMessage: 'Failed to create tip',
-          onStart: start('creating'),
-          onError: fail,
-          isMounted: () => isMountedRef.current,
-        },
+    (data: CreateTipRequest, options?: { debounceMs?: number }): Promise<Transaction> =>
+      withSubmissionGuard(
+        'createTip',
         () =>
-          withAbort(async (signal) => {
-            const tip = await client.createTip(data, { signal });
-            safeSetState((s) => ({ ...s, data: tip, step: 'idle', loading: false }));
-            return tip;
-          })
+          runSafely(
+            { setError, setIsLoading },
+            {
+              code: 'CREATE_TIP_ERROR',
+              fallbackMessage: 'Failed to create tip',
+              onStart: start('creating'),
+              onError: fail,
+              isMounted: () => isMountedRef.current,
+            },
+            () =>
+              withAbort(async (signal) => {
+                const tip = await client.createTip(data, { signal });
+                safeDispatch({ type: 'COMPLETE', data: tip, step: 'idle' });
+                return tip;
+              })
+          ),
+        options?.debounceMs ?? 500
       ),
-    [client, setError, setIsLoading, safeSetState]
+    [client, setError, setIsLoading, safeDispatch, start, fail, withSubmissionGuard]
   );
 
   const buildTransaction = useCallback(
-    (tipId: string, data: BuildTransactionRequest) =>
-      runSafely(
-        { setError, setIsLoading },
-        {
-          code: 'BUILD_TRANSACTION_ERROR',
-          fallbackMessage: 'Failed to build transaction',
-          onStart: start('building'),
-          onError: fail,
-          isMounted: () => isMountedRef.current,
-        },
+    (tipId: string, data: BuildTransactionRequest, options?: { debounceMs?: number }) =>
+      withSubmissionGuard(
+        'buildTransaction',
         () =>
-          withAbort(async (signal) => {
-            const result = await client.buildPaymentTransaction(tipId, data, { signal });
-            safeSetState((s) => ({ ...s, step: 'idle', loading: false }));
-            return result;
-          })
+          runSafely(
+            { setError, setIsLoading },
+            {
+              code: 'BUILD_TRANSACTION_ERROR',
+              fallbackMessage: 'Failed to build transaction',
+              onStart: start('building'),
+              onError: fail,
+              isMounted: () => isMountedRef.current,
+            },
+            () =>
+              withAbort(async (signal) => {
+                const result = await client.buildPaymentTransaction(tipId, data, { signal });
+                safeDispatch({ type: 'COMPLETE', step: 'idle' });
+                return result;
+              })
+          ),
+        options?.debounceMs ?? 500
       ),
-    [client, setError, setIsLoading, safeSetState]
+    [client, setError, setIsLoading, safeDispatch, start, fail, withSubmissionGuard]
   );
 
   const submitTransaction = useCallback(
-    (tipId: string, envelope: string) =>
-      runSafely(
-        { setError, setIsLoading },
-        {
-          code: 'SUBMIT_TRANSACTION_ERROR',
-          fallbackMessage: 'Failed to submit transaction',
-          onStart: start('submitting'),
-          onError: fail,
-          isMounted: () => isMountedRef.current,
-        },
+    (tipId: string, envelope: string, options?: { debounceMs?: number }) =>
+      withSubmissionGuard(
+        'submitTransaction',
         () =>
-          withAbort(async (signal) => {
-            const result = await client.submitPaymentTransaction(
-              tipId,
-              {
-                transactionEnvelope: envelope,
-              },
-              { signal }
-            );
-            safeSetState((s) => ({ ...s, step: 'idle', loading: false }));
-            return result;
-          })
+          runSafely(
+            { setError, setIsLoading },
+            {
+              code: 'SUBMIT_TRANSACTION_ERROR',
+              fallbackMessage: 'Failed to submit transaction',
+              onStart: start('submitting'),
+              onError: fail,
+              isMounted: () => isMountedRef.current,
+            },
+            () =>
+              withAbort(async (signal) => {
+                const result = await client.submitPaymentTransaction(
+                  tipId,
+                  {
+                    envelope,
+                  },
+                  { signal }
+                );
+                safeDispatch({ type: 'COMPLETE', step: 'idle' });
+                return result;
+              })
+          ),
+        options?.debounceMs ?? 500
       ),
-    [client, setError, setIsLoading, safeSetState]
+    [client, setError, setIsLoading, safeDispatch, start, fail, withSubmissionGuard]
   );
 
   const confirmTransaction = useCallback(
-    (tipId: string): Promise<Transaction> =>
-      runSafely(
-        { setError, setIsLoading },
-        {
-          code: 'CONFIRM_TRANSACTION_ERROR',
-          fallbackMessage: 'Failed to confirm transaction',
-          onStart: start('confirming'),
-          onError: fail,
-          isMounted: () => isMountedRef.current,
-        },
+    (tipId: string, options?: { debounceMs?: number }): Promise<Transaction> =>
+      withSubmissionGuard(
+        'confirmTransaction',
         () =>
-          withAbort(async (signal) => {
-            const tip = await client.checkTransactionConfirmation(tipId, { signal });
-            safeSetState((s) => ({ ...s, data: tip, step: 'success', loading: false }));
-            return tip;
-          })
+          runSafely(
+            { setError, setIsLoading },
+            {
+              code: 'CONFIRM_TRANSACTION_ERROR',
+              fallbackMessage: 'Failed to confirm transaction',
+              onStart: start('confirming'),
+              onError: fail,
+              isMounted: () => isMountedRef.current,
+            },
+            () =>
+              withAbort(async (signal) => {
+                const tip = await client.checkTransactionConfirmation(tipId, { signal });
+                safeDispatch({ type: 'COMPLETE', data: tip, step: 'success' });
+                return tip;
+              })
+          ),
+        options?.debounceMs ?? 500
       ),
-    [client, setError, setIsLoading, safeSetState]
+    [client, setError, setIsLoading, safeDispatch, start, fail, withSubmissionGuard]
   );
 
   const reset = useCallback(() => {
-    safeSetState({
-      loading: false,
-      step: 'idle',
-    });
-  }, [safeSetState]);
+    inFlightRef.current = false;
+    inFlightPromiseRef.current = null;
+    lastSubmitTimeRef.current = {};
+    safeDispatch({ type: 'RESET' });
+  }, [safeDispatch]);
+
+  useDebugValue(
+    formatDebugValue({
+      loading: state.loading,
+      submitting: state.submitting,
+      step: state.step,
+      error: state.error,
+      dataId: state.data?.id,
+    })
+  );
 
   return {
     ...state,
