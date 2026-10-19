@@ -9,10 +9,11 @@
  *   the wallet filter or hits a stale creator after rapid switches.
  */
 
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, useDebugValue } from 'react';
 import { useDorisio } from './DorisioProvider';
 import { ApiCreatorEarningsSchema } from '../types/schemas';
 import { logRejection, runSafely } from './safe-async';
+import { formatDebugValue } from './debug-format';
 
 export interface CreatorBalance {
   totalEarnings: number;
@@ -41,6 +42,12 @@ export interface UseCreatorBalanceActions {
  * Optionally auto-fetches on mount if creatorId is provided. Auto-fetch failures are
  * exposed via `error` and logged to the console rather than raised as unhandled
  * rejections; manual `fetchBalance()` / `refetch()` calls reject with the original error.
+ *
+ * @debugValue Displays `{ loading, error, balance, lastUpdated }` in React DevTools.
+ *   - `loading` (boolean): whether a request is in flight
+ *   - `error` (string | undefined): last error message, if any
+ *   - `balance` (object | undefined): { totalEarnings, pendingBalance } of the creator, if loaded
+ *   - `lastUpdated` (number | undefined): timestamp of the last successful fetch
  *
  * @example
  * ```tsx
@@ -88,11 +95,21 @@ export function useCreatorBalance(
     };
   }, []);
 
+  // Tracks the most recent request so a superseding fetch (e.g. the creator id
+  // changed) cancels the previous in-flight request instead of leaving it to
+  // resolve into a state update that is merely ignored.
+  const activeControllerRef = useRef<AbortController | null>(null);
+
   const withAbort = <T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+    activeControllerRef.current?.abort();
     const controller = new AbortController();
+    activeControllerRef.current = controller;
     abortControllersRef.current.add(controller);
     return fn(controller.signal).finally(() => {
       abortControllersRef.current.delete(controller);
+      if (activeControllerRef.current === controller) {
+        activeControllerRef.current = null;
+      }
     });
   };
 
@@ -109,10 +126,14 @@ export function useCreatorBalance(
   const creatorIdRef = useRef(creatorId);
   creatorIdRef.current = creatorId;
   const walletIdRef = useRef<string | undefined>(undefined);
+  const requestIdRef = useRef(0);
 
   const fetchBalance = useCallback(
-    (id: string, walletId?: string): Promise<CreatorBalance> =>
-      runSafely(
+    (id: string, walletId?: string): Promise<CreatorBalance> => {
+      const requestId = ++requestIdRef.current;
+      const isCurrentRequest = () => requestId === requestIdRef.current;
+
+      return runSafely(
         { setError, setIsLoading },
         {
           code: 'FETCH_BALANCE_ERROR',
@@ -124,8 +145,12 @@ export function useCreatorBalance(
             }
             creatorIdRef.current = id;
           },
-          onError: (error) => safeSetState((s) => ({ ...s, error, loading: false })),
-          isMounted: () => isMountedRef.current,
+          onError: (error) => {
+            if (isCurrentRequest()) {
+              safeSetState((s) => ({ ...s, error, loading: false }));
+            }
+          },
+          isMounted: () => isMountedRef.current && isCurrentRequest(),
         },
         () =>
           withAbort(async (signal) => {
@@ -176,11 +201,14 @@ export function useCreatorBalance(
               }
             }
 
-            safeSetState((s) => ({ ...s, balance, lastUpdated: Date.now(), loading: false }));
+            if (isCurrentRequest()) {
+              safeSetState((s) => ({ ...s, balance, lastUpdated: Date.now(), loading: false }));
+            }
 
             return balance;
           })
-      ),
+      );
+    },
     [client, setError, setIsLoading, safeSetState]
   );
 
@@ -192,6 +220,7 @@ export function useCreatorBalance(
   }, [fetchBalance]);
 
   const reset = useCallback(() => {
+    requestIdRef.current += 1;
     safeSetState({
       loading: false,
     });
@@ -202,14 +231,24 @@ export function useCreatorBalance(
     walletIdRef.current = undefined;
   }, [safeSetState]);
 
-  // Auto-fetch on mount
+  // Auto-fetch when the requested creator or fetch configuration changes.
   useEffect(() => {
     if (autoFetch && initialCreatorId) {
       // Error is already reflected in hook state; just make sure it can't go unhandled.
       logRejection(fetchBalance(initialCreatorId), 'useCreatorBalance auto-fetch');
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only autoFetch
-  }, []);
+  }, [autoFetch, initialCreatorId, fetchBalance]);
+
+  useDebugValue(
+    formatDebugValue({
+      loading: state.loading,
+      error: state.error,
+      balance: state.balance
+        ? { totalEarnings: state.balance.totalEarnings, pendingBalance: state.balance.pendingBalance }
+        : undefined,
+      lastUpdated: state.lastUpdated,
+    })
+  );
 
   return {
     ...state,
